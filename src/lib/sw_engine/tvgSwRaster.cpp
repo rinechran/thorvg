@@ -113,6 +113,26 @@ static uint32_t _applyBilinearInterpolation(const uint32_t *img, uint32_t w, uin
     return COLOR_BILINEAR_INTERPOLATE(c1, c2, c3, c4, dX, dY);
 }
 
+static uint32_t _average2Nx2NPixel(const uint32_t *img, uint32_t w, uint32_t h, uint32_t rX, uint32_t rY, uint32_t n)
+{
+    uint32_t r, g, b, a;
+    r = g = b = a = 0;
+    auto n2 = n * n * 4;
+
+    for (auto x = rX - n; x < rX + n; ++x) {
+        for (auto y = rY - n; y < rY + n; ++y) {
+            r += img[x + (y * w)] >> 24;
+            g += (img[x + (y * w)] >> 16) & 0xff;
+            b += (img[x + (y * w)] >> 8) & 0xff;
+            a += img[x + (y * w)] & 0xff;
+        }
+    }
+    r /= n2;
+    g /= n2;
+    b /= n2;
+    a /= n2;
+    return (r << 24) + (g << 16) + (b << 8) + a;
+}
 
 /************************************************************************/
 /* Rect                                                                 */
@@ -755,13 +775,36 @@ static bool _rasterImage(SwSurface* surface, const uint32_t *img, uint32_t w, ui
             auto rX = static_cast<uint32_t>(roundf(x * invTransform->e11 + ey1));
             auto rY = static_cast<uint32_t>(roundf(x * invTransform->e21 + ey2));
             if (rX >= w || rY >= h) continue;
-            auto src = img[rX + (rY * w)];    //TODO: need to use image's stride
+            auto src = img[rX + (rY * w)];
             *dst = src + ALPHA_BLEND(*dst, 255 - surface->blender.alpha(src));
         }
     }
     return true;
 }
 
+static bool _rasterDownScaleImage(SwSurface* surface, const uint32_t *img, uint32_t w, uint32_t h, const SwBBox& region, const Matrix* invTransform)
+{
+    auto halfScaleRatio = static_cast<uint32_t>(sqrt((invTransform->e11 * invTransform->e11) + (invTransform->e21 * invTransform->e21)) / 2);
+    if (halfScaleRatio == 0) halfScaleRatio = 1;
+    for (auto y = region.min.y; y < region.max.y; ++y) {
+        auto dst = &surface->buffer[y * surface->stride + region.min.x];
+        auto ey1 = y * invTransform->e12 + invTransform->e13;
+        auto ey2 = y * invTransform->e22 + invTransform->e23;
+        for (auto x = region.min.x; x < region.max.x; ++x, ++dst) {
+            auto rX = static_cast<uint32_t>(roundf(x * invTransform->e11 + ey1));
+            auto rY = static_cast<uint32_t>(roundf(x * invTransform->e21 + ey2));
+            if (rX >= w || rY >= h) continue;
+            uint32_t src;
+            if (rX < halfScaleRatio || rY < halfScaleRatio || rX >= w - halfScaleRatio || rY >= h - halfScaleRatio) {
+                src = img[rX + (rY * w)];
+            } else {
+                src = _average2Nx2NPixel(img, w, h, rX, rY, halfScaleRatio);
+            }
+            *dst = src + ALPHA_BLEND(*dst, 255 - surface->blender.alpha(src));
+        }
+    }
+    return true;
+}
 
 static bool _rasterUpScaleImage(SwSurface* surface, const uint32_t *img, uint32_t w, uint32_t h, const SwBBox& region, const Matrix* invTransform)
 {
@@ -1395,10 +1438,12 @@ bool rasterImage(SwSurface* surface, SwImage* image, const Matrix* transform, co
 {
     Matrix invTransform;
     auto isUpScaling = false;
+    auto scaling = 0;
 
     if (transform) {
         if (!_inverse(transform, &invTransform)) return false;
-        isUpScaling = (transform->e11 * transform->e11) + (transform->e21 * transform->e21) > 1 ? true : false;
+        scaling = sqrt((transform->e11 * transform->e11) + (transform->e21 * transform->e21));
+        isUpScaling = scaling > 1 ? true : false;
     }
     else invTransform = {1, 0, 0, 0, 1, 0, 0, 0, 1};
 
@@ -1431,7 +1476,8 @@ bool rasterImage(SwSurface* surface, SwImage* image, const Matrix* transform, co
                 return _rasterTranslucentImage(surface, image->data, image->w, image->h, opacity, bbox, &invTransform);
             }
             if (isUpScaling) return _rasterUpScaleImage(surface, image->data, image->w, image->h, bbox, &invTransform);
-            return _rasterImage(surface, image->data, image->w, image->h, bbox, &invTransform);
+            if (scaling != 1) return _rasterDownScaleImage(surface, image->data, image->w, image->h, bbox, &invTransform);
+            else return _rasterImage(surface, image->data, image->w, image->h, bbox, &invTransform);
         }
     }
 }
